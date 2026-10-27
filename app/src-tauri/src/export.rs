@@ -291,6 +291,116 @@ pub async fn export_pads(
     .await
 }
 
+/// Render one pad on the unit through a temporary one-note pattern. Only a slot which is
+/// empty both in the device's index and on disk is used, so user patterns are never
+/// replaced. MULTIPAD is the dry stem path: pad playback settings are applied, while BUS
+/// and master effects are not part of the result.
+#[tauri::command]
+pub async fn export_rendered_pad(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pad: u16,
+    target: String,
+    folder: String,
+) -> CmdResult<String> {
+    with_device(&state, move |dev| {
+        let pad = pad_index(pad)?;
+        let pad_state = read_pad(dev, pad)?;
+        let sample = pad_state
+            .detail
+            .sample
+            .as_ref()
+            .ok_or_else(|| Failure::Other(format!("{pad} is empty")))?;
+        let project = dev.current_project()?;
+        let root = format!("ROLAND/SP-404MKII/PROJECT_{:02}/PTN", project + 1);
+
+        // Work backwards so the temporary slot is normally out of the user's way. Check
+        // both views: a stale file must not be mistaken for a safely empty slot.
+        let mut temporary = None;
+        for slot in (0..160).rev().filter_map(PadIndex::new) {
+            let path = format!("{root}/PTN{:05}.BIN", slot.index() + 1);
+            if !dev.pattern_exists(slot)? && dev.stat(&path)?.is_none() {
+                temporary = Some((slot, path));
+                break;
+            }
+        }
+        let (slot, pattern_path) = temporary.ok_or_else(|| {
+            Failure::Other(
+                "Rendered export needs one empty pattern slot; this project has none".into(),
+            )
+        })?;
+
+        // Allow for the slowest pitch/stretch combination and an envelope tail. The
+        // completed stem is trimmed back to its last audible frame below.
+        let source_seconds = sample.end.saturating_sub(sample.start) as f64 / 48_000.0;
+        let tempo = f64::from(
+            dev.project_settings(project)?
+                .bank(slot.bank() as usize)
+                .tempo,
+        ) / 100.0;
+        let wanted_seconds = source_seconds * 3.0 + 2.0;
+        let bars = ((wanted_seconds * tempo / 240.0).ceil() as u8).clamp(1, 64);
+        let pattern = sp404_formats::pattern::single_pad(pad, bars);
+        let place = Place::new(&target, &folder)?;
+        place.create(dev)?;
+        let file = format!(
+            "{} {} rendered.wav",
+            label(pad),
+            sanitize(&pad_state.detail.name)
+        );
+        emit(&app, &file, 0, 1);
+
+        dev.write_file(&pattern_path, &pattern)?;
+        let rendered = (|| -> Result<Vec<u8>, Failure> {
+            dev.reload_current_project()?;
+            let mut out = std::io::Cursor::new(Vec::new());
+            dev.render_pattern_pad(slot, pad, &mut out)?;
+            trim_rendered(out.into_inner(), sample.end.saturating_sub(sample.start))
+        })();
+
+        // Cleanup is attempted regardless of rendering success. Do not hide a cleanup
+        // failure after a successful render, because that would leave a visible pattern.
+        let removed = dev.unlink(&pattern_path);
+        let reloaded = dev.reload_current_project();
+        let cleanup = removed.and(reloaded);
+        let sound = match (rendered, cleanup) {
+            (Ok(sound), Ok(())) => sound,
+            (Ok(_), Err(cleanup)) => return Err(cleanup.into()),
+            (Err(render), Ok(())) => return Err(render),
+            (Err(render), Err(cleanup)) => {
+                let render = match render {
+                    Failure::Device(error) => error.to_string(),
+                    Failure::Other(error) => error,
+                };
+                return Err(Failure::Other(format!(
+                    "{render}; removing the temporary pattern also failed: {cleanup}"
+                )));
+            }
+        };
+        place.write(dev, &file, &sound)?;
+        emit(&app, &file, 1, 1);
+        Ok(file)
+    })
+    .await
+}
+
+/// Remove the exact-zero tail added by the temporary pattern, retaining 50 ms after the
+/// last audible frame. If the render is silent, keep one source-length pass instead.
+fn trim_rendered(bytes: Vec<u8>, source_frames: u32) -> Result<Vec<u8>, Failure> {
+    let mut sample = audio::read_bytes(bytes, "wav")?.sample;
+    let channels = usize::from(sample.channels.max(1));
+    let audible = sample
+        .samples
+        .chunks_exact(channels)
+        .rposition(|frame| frame.iter().any(|&value| value != 0));
+    let frames = match audible {
+        Some(last) => (last + 1 + 2_400).min(sample.frames()),
+        None => (source_frames as usize).max(1).min(sample.frames().max(1)),
+    };
+    sample.samples.truncate(frames * channels);
+    Ok(wav::to_bytes(&sample)?)
+}
+
 fn parse_sidecar(bytes: &[u8]) -> Result<Sidecar, Failure> {
     let sheet: Sidecar = serde_json::from_slice(bytes)
         .map_err(|e| Failure::Other(format!("{SIDECAR} is not readable: {e}")))?;
